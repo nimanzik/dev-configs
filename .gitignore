@@ -15,3 +15,4 @@ wheels/
 !sample_config.yaml
 !sample_config.json
 !.pre-commit-config.yaml
+!mcp-config.json

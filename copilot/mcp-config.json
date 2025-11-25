@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "context7": {
+      "type": "local",
+      "command": "npx",
+      "tools": [
+        "get-library-docs",
+        "resolve-library-id"
+      ],
+      "args": [
+        "-y",
+        "@upstash/context7-mcp"
+      ]
+    }
+  }
+}
