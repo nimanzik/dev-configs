@@ -53,6 +53,12 @@
 - Use assert statements directly, not `self.assertEqual`.
 - Tests under `tests/` mirror `src/<project-name>/` structure.
 
+## Git commits
+
+- Always use conventional commits (feat, fix, chore, docs, build, test, etc.).
+- When committing multiple unrelated changes, commit them separately in logical groups.
+- Show the plan before committing.
+
 ## Markdown standards
 
 - Always run `markdownlint` on any markdown files created or edited.
