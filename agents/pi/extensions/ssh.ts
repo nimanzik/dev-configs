@@ -14,7 +14,7 @@
  */
 
 import { spawn } from "node:child_process";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	type BashOperations,
 	createBashTool,
@@ -24,11 +24,16 @@ import {
 	type EditOperations,
 	type ReadOperations,
 	type WriteOperations,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
+
+function shellSingleQuote(value: string): string {
+	return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
 
 function sshExec(remote: string, command: string): Promise<Buffer> {
 	return new Promise((resolve, reject) => {
-		const child = spawn("ssh", [remote, command], { stdio: ["ignore", "pipe", "pipe"] });
+		const remoteCmd = `/bin/bash -lc ${shellSingleQuote(command)}`;
+		const child = spawn("ssh", [remote, remoteCmd], { stdio: ["ignore", "pipe", "pipe"] });
 		const chunks: Buffer[] = [];
 		const errChunks: Buffer[] = [];
 		child.stdout.on("data", (data) => chunks.push(data));
@@ -84,7 +89,8 @@ function createRemoteBashOps(remote: string, remoteCwd: string, localCwd: string
 		exec: (command, cwd, { onData, signal, timeout }) =>
 			new Promise((resolve, reject) => {
 				const cmd = `cd ${JSON.stringify(toRemote(cwd))} && ${command}`;
-				const child = spawn("ssh", [remote, cmd], { stdio: ["ignore", "pipe", "pipe"] });
+				const remoteCmd = `/bin/bash -lc ${shellSingleQuote(cmd)}`;
+				const child = spawn("ssh", [remote, remoteCmd], { stdio: ["ignore", "pipe", "pipe"] });
 				let timedOut = false;
 				const timer = timeout
 					? setTimeout(() => {
