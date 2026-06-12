@@ -14,7 +14,9 @@
  */
 
 import { spawn } from "node:child_process";
+import { basename } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { AutocompleteItem, AutocompleteProvider } from "@earendil-works/pi-tui";
 import {
 	type BashOperations,
 	createBashTool,
@@ -47,6 +49,139 @@ function sshExec(remote: string, command: string): Promise<Buffer> {
 			}
 		});
 	});
+}
+
+function escapeRegex(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function buildFdPathQuery(query: string): string {
+	const normalized = query.replace(/\\/g, "/");
+	if (!normalized.includes("/")) return normalized;
+
+	const hasTrailingSeparator = normalized.endsWith("/");
+	const segments = normalized
+		.replace(/^\/+|\/+$/g, "")
+		.split("/")
+		.filter(Boolean)
+		.map((segment) => escapeRegex(segment));
+
+	if (segments.length === 0) return normalized;
+	return `${segments.join("[\\\\/]")}${hasTrailingSeparator ? "[\\\\/]" : ""}`;
+}
+
+function fuzzyScore(path: string, query: string, isDirectory: boolean): number {
+	if (!query) return isDirectory ? 2 : 1;
+
+	const name = basename(path).toLowerCase();
+	const lowerPath = path.toLowerCase();
+	const lowerQuery = query.toLowerCase();
+	let score = 0;
+
+	if (name === lowerQuery) score = 100;
+	else if (name.startsWith(lowerQuery)) score = 80;
+	else if (name.includes(lowerQuery)) score = 50;
+	else if (lowerPath.includes(lowerQuery)) score = 30;
+
+	return isDirectory && score > 0 ? score + 10 : score;
+}
+
+function extractAtPrefix(text: string): string | null {
+	const quotedMatch = /(^|[\s=])@"[^"]*$/.exec(text);
+	if (quotedMatch) return text.slice((quotedMatch.index ?? 0) + quotedMatch[1].length);
+
+	const delimiter = Math.max(text.lastIndexOf(" "), text.lastIndexOf("\t"), text.lastIndexOf("\""), text.lastIndexOf("'"), text.lastIndexOf("="));
+	const token = text.slice(delimiter + 1);
+	return token.startsWith("@") ? token : null;
+}
+
+async function getRemoteFileSuggestions(
+	remote: string,
+	remoteCwd: string,
+	query: string,
+	isQuotedPrefix: boolean,
+): Promise<AutocompleteItem[]> {
+	const fdQuery = buildFdPathQuery(query);
+	const fdArgs = [
+		"--max-results 100",
+		"--type f",
+		"--type d",
+		"--follow",
+		"--hidden",
+		"--exclude .git",
+	];
+	if (query.includes("/")) fdArgs.push("--full-path");
+	if (fdQuery) fdArgs.push(shellSingleQuote(fdQuery));
+
+	const command = `
+		cd ${shellSingleQuote(remoteCwd)} || exit 1
+		fd_bin=$(command -v fd || command -v fdfind || true)
+		if [ -n "$fd_bin" ]; then
+			"$fd_bin" ${fdArgs.join(" ")} | while IFS= read -r p; do
+				[ -z "$p" ] && continue
+				if [ -d "$p" ]; then printf 'd\\t%s\\n' "$p"; else printf 'f\\t%s\\n' "$p"; fi
+			done
+		else
+			find . -path './.git' -prune -o \\( -type f -o -type d \\) -printf '%y\\t%P\\n' 2>/dev/null | head -n 5000
+		fi
+	`;
+
+	const output = (await sshExec(remote, command)).toString();
+	const rawQuery = query.split("/").pop() ?? query;
+	const suggestions = output
+		.split("\n")
+		.map((line) => {
+			const tab = line.indexOf("\t");
+			if (tab === -1) return null;
+			const type = line.slice(0, tab);
+			const path = line.slice(tab + 1).replace(/^\.\//, "");
+			if (!path || path === ".git" || path.startsWith(".git/")) return null;
+			const isDirectory = type === "d";
+			const score = fuzzyScore(path, rawQuery, isDirectory);
+			return score > 0 ? { path, isDirectory, score } : null;
+		})
+		.filter((entry): entry is { path: string; isDirectory: boolean; score: number } => entry !== null)
+		.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
+		.slice(0, 20);
+
+	return suggestions.map(({ path, isDirectory }) => {
+		const displayPath = `${path}${isDirectory ? "/" : ""}`;
+		const needsQuotes = isQuotedPrefix || displayPath.includes(" ");
+		const value = needsQuotes ? `@"${displayPath}"` : `@${displayPath}`;
+		return {
+			value,
+			label: `${basename(path)}${isDirectory ? "/" : ""}`,
+			description: displayPath,
+		};
+	});
+}
+
+function createRemoteAutocompleteProvider(remote: string, remoteCwd: string, current: AutocompleteProvider): AutocompleteProvider {
+	return {
+		...current,
+		triggerCharacters: [...new Set([...(current.triggerCharacters ?? []), "@"])],
+		async getSuggestions(lines, cursorLine, cursorCol, options) {
+			const currentLine = lines[cursorLine] ?? "";
+			const textBeforeCursor = currentLine.slice(0, cursorCol);
+			const atPrefix = extractAtPrefix(textBeforeCursor);
+			if (!atPrefix) return current.getSuggestions(lines, cursorLine, cursorCol, options);
+
+			try {
+				const isQuotedPrefix = atPrefix.startsWith('@"');
+				const query = isQuotedPrefix ? atPrefix.slice(2) : atPrefix.slice(1);
+				const items = await getRemoteFileSuggestions(remote, remoteCwd, query, isQuotedPrefix);
+				return items.length > 0 ? { items, prefix: atPrefix } : null;
+			} catch {
+				return null;
+			}
+		},
+		applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
+			return current.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
+		},
+		shouldTriggerFileCompletion(lines, cursorLine, cursorCol) {
+			return current.shouldTriggerFileCompletion?.(lines, cursorLine, cursorCol) ?? true;
+		},
+	};
 }
 
 function createRemoteReadOps(remote: string, remoteCwd: string, localCwd: string): ReadOperations {
@@ -201,6 +336,9 @@ export default function (pi: ExtensionAPI) {
 				resolvedSsh = { remote, remoteCwd: pwd };
 			}
 			ctx.ui.setStatus("ssh", ctx.ui.theme.fg("accent", `SSH: ${resolvedSsh.remote}:${resolvedSsh.remoteCwd}`));
+			ctx.ui.addAutocompleteProvider((current) =>
+				createRemoteAutocompleteProvider(resolvedSsh!.remote, resolvedSsh!.remoteCwd, current),
+			);
 			ctx.ui.notify(`SSH mode: ${resolvedSsh.remote}:${resolvedSsh.remoteCwd}`, "info");
 		}
 	});
