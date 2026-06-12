@@ -32,21 +32,47 @@ function shellSingleQuote(value: string): string {
 	return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
-function sshExec(remote: string, command: string): Promise<Buffer> {
+function sshExec(remote: string, command: string, signal?: AbortSignal): Promise<Buffer> {
 	return new Promise((resolve, reject) => {
+		if (signal?.aborted) {
+			reject(new Error("SSH aborted"));
+			return;
+		}
+
 		const remoteCmd = `/bin/bash -lc ${shellSingleQuote(command)}`;
 		const child = spawn("ssh", [remote, remoteCmd], { stdio: ["ignore", "pipe", "pipe"] });
 		const chunks: Buffer[] = [];
 		const errChunks: Buffer[] = [];
+		let settled = false;
+
+		const cleanup = () => signal?.removeEventListener("abort", onAbort);
+		const finish = (callback: () => void) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			callback();
+		};
+		const onAbort = () => {
+			child.kill();
+			finish(() => reject(new Error("SSH aborted")));
+		};
+
+		signal?.addEventListener("abort", onAbort, { once: true });
+		if (signal?.aborted) {
+			onAbort();
+			return;
+		}
 		child.stdout.on("data", (data) => chunks.push(data));
 		child.stderr.on("data", (data) => errChunks.push(data));
-		child.on("error", reject);
+		child.on("error", (error) => finish(() => reject(error)));
 		child.on("close", (code) => {
-			if (code !== 0) {
-				reject(new Error(`SSH failed (${code}): ${Buffer.concat(errChunks).toString()}`));
-			} else {
-				resolve(Buffer.concat(chunks));
-			}
+			finish(() => {
+				if (code !== 0) {
+					reject(new Error(`SSH failed (${code}): ${Buffer.concat(errChunks).toString()}`));
+				} else {
+					resolve(Buffer.concat(chunks));
+				}
+			});
 		});
 	});
 }
@@ -56,18 +82,26 @@ function escapeRegex(value: string): string {
 }
 
 function buildFdPathQuery(query: string): string {
+	return escapeRegex(query.replace(/\\/g, "/"));
+}
+
+function parseScopedPathQuery(query: string): { scopeDir: string; leafQuery: string; filterScope: string } {
 	const normalized = query.replace(/\\/g, "/");
-	if (!normalized.includes("/")) return normalized;
+	const slash = normalized.lastIndexOf("/");
+	if (slash === -1) return { scopeDir: "", leafQuery: normalized, filterScope: "" };
 
-	const hasTrailingSeparator = normalized.endsWith("/");
-	const segments = normalized
-		.replace(/^\/+|\/+$/g, "")
-		.split("/")
-		.filter(Boolean)
-		.map((segment) => escapeRegex(segment));
+	const scopeDir = normalized.slice(0, slash + 1);
+	const filterScope = scopeDir.startsWith("/") ? scopeDir : scopeDir.replace(/^\.\//, "");
+	return {
+		scopeDir,
+		leafQuery: normalized.slice(slash + 1),
+		filterScope,
+	};
+}
 
-	if (segments.length === 0) return normalized;
-	return `${segments.join("[\\\\/]")}${hasTrailingSeparator ? "[\\\\/]" : ""}`;
+function normalizeSuggestionPath(path: string): string {
+	const normalized = path.replace(/\\/g, "/");
+	return normalized.startsWith("/") ? normalized : normalized.replace(/^\.\//, "");
 }
 
 function fuzzyScore(path: string, query: string, isDirectory: boolean): number {
@@ -100,8 +134,11 @@ async function getRemoteFileSuggestions(
 	remoteCwd: string,
 	query: string,
 	isQuotedPrefix: boolean,
+	signal?: AbortSignal,
 ): Promise<AutocompleteItem[]> {
-	const fdQuery = buildFdPathQuery(query);
+	const { scopeDir, leafQuery, filterScope } = parseScopedPathQuery(query);
+	const fdQuery = buildFdPathQuery(leafQuery);
+	const searchRoot = scopeDir ? (scopeDir === "/" ? "/" : scopeDir.replace(/\/+$/, "")) : ".";
 	const fdArgs = [
 		"--max-results 100",
 		"--type f",
@@ -110,8 +147,8 @@ async function getRemoteFileSuggestions(
 		"--hidden",
 		"--exclude .git",
 	];
-	if (query.includes("/")) fdArgs.push("--full-path");
-	if (fdQuery) fdArgs.push(shellSingleQuote(fdQuery));
+	if (scopeDir || fdQuery) fdArgs.push("--", shellSingleQuote(fdQuery || "."));
+	if (scopeDir) fdArgs.push(shellSingleQuote(searchRoot));
 
 	const command = `
 		cd ${shellSingleQuote(remoteCwd)} || exit 1
@@ -122,20 +159,21 @@ async function getRemoteFileSuggestions(
 				if [ -d "$p" ]; then printf 'd\\t%s\\n' "$p"; else printf 'f\\t%s\\n' "$p"; fi
 			done
 		else
-			find . -path './.git' -prune -o \\( -type f -o -type d \\) -printf '%y\\t%P\\n' 2>/dev/null | head -n 5000
+			find ${shellSingleQuote(searchRoot)} -name .git -prune -o \\( -type f -o -type d \\) -printf '%y\\t%p\\n' 2>/dev/null | head -n 5000
 		fi
 	`;
 
-	const output = (await sshExec(remote, command)).toString();
-	const rawQuery = query.split("/").pop() ?? query;
+	const output = (await sshExec(remote, command, signal)).toString();
+	const rawQuery = leafQuery;
 	const suggestions = output
 		.split("\n")
 		.map((line) => {
 			const tab = line.indexOf("\t");
 			if (tab === -1) return null;
 			const type = line.slice(0, tab);
-			const path = line.slice(tab + 1).replace(/^\.\//, "");
-			if (!path || path === ".git" || path.startsWith(".git/")) return null;
+			const path = normalizeSuggestionPath(line.slice(tab + 1));
+			if (!path || path === "." || path === ".git" || path.startsWith(".git/")) return null;
+			if (filterScope && !path.startsWith(filterScope)) return null;
 			const isDirectory = type === "d";
 			const score = fuzzyScore(path, rawQuery, isDirectory);
 			return score > 0 ? { path, isDirectory, score } : null;
@@ -169,7 +207,8 @@ function createRemoteAutocompleteProvider(remote: string, remoteCwd: string, cur
 			try {
 				const isQuotedPrefix = atPrefix.startsWith('@"');
 				const query = isQuotedPrefix ? atPrefix.slice(2) : atPrefix.slice(1);
-				const items = await getRemoteFileSuggestions(remote, remoteCwd, query, isQuotedPrefix);
+				if (options.signal?.aborted) return null;
+				const items = await getRemoteFileSuggestions(remote, remoteCwd, query, isQuotedPrefix, options.signal);
 				return items.length > 0 ? { items, prefix: atPrefix } : null;
 			} catch {
 				return null;
