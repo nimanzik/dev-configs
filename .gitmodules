@@ -11,3 +11,7 @@
 	path = agents/pi/third_party/agent-stuff
 	url = git@github.com:nimanzik/agent-stuff.git
 	branch = nima/custom-changes
+[submodule "agents/pi/third_party/pi-smart-sessions"]
+	path = agents/pi/third_party/pi-smart-sessions
+	url = https://github.com/nimanzik/pi-smart-sessions.git
+	branch = nima/custom-changes
