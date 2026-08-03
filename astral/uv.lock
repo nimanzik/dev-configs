@@ -1,0 +1,3 @@
+# Skip packages published in the last 7 days, which is enough window for
+# PyPI's malware scanners to catch most supply-chain attacks.
+exclude-newer = "7 days"
