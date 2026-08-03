@@ -12,8 +12,8 @@ lint:
 format:
     @uv run ruff format src/
 
-type-check:
+typecheck:
     @uv run ty check src/
 
 test:
-    @uv run pytest tests -v
+    @uv run --python 3.12 --with tensorflow-cpu --extra torch-cpu pytest -v --tb=short tests/
