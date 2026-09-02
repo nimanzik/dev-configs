@@ -2,9 +2,9 @@
 
 ## Commands
 
-- **Linting**: `uv run ruff check --fix src/`
-- **Formatting**: `uv run ruff format src/`
-- **Type checking**: `uv run ty check src/` (Do NOT use mypy)
+- **Linting**: `uvx ruff check --fix src/`
+- **Formatting**: `uvx ruff format src/`
+- **Type checking**: `uvx ty check src/` (Do NOT use mypy)
 - **Testing all**: `uv run pytest tests -v --tb=short`
 - **Testing single**:
   `uv run pytest tests/path/to/test_file.py::test_function_name -v --tb=short`
